@@ -196,8 +196,9 @@ def create_labels(ds: Dataset) -> Dataset:
     """
     def split_seq(example):
         seq = example["sequences"][:-1]
+        seq_str = " ".join(map(str, seq))
         label = example["sequences"][-1]
-        return {"seq": seq, "label": label}
+        return {"prompt": seq_str, "completion": str(label)}
     
     new_ds = ds.map(split_seq, remove_columns=["sequences"])
     return new_ds
@@ -214,6 +215,6 @@ def prepare_data(name, K=5, split_type: Literal["user", "leave_one_out"] = "user
     ds_train = create_labels(ds_train)
     ds_valid = create_labels(ds_valid)
     ds_test = create_labels(ds_test)
-    return ds_train, ds_valid, ds_test
+    return ds_train, ds_valid, ds_test, asin2id
 
     
