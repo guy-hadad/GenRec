@@ -63,12 +63,14 @@ def create_item_id_mappings(ds):
     id2asin = {idx: asin for asin, idx in asin2id.items()}
     return asin2id, id2asin
 
-def create_plain_sequences_dataset(ds, asin2id):
+def create_plain_sequences_dataset(ds, asin2id, max_hist=None):
     """
     Create a new dataset with a single column 'sequences',
     where each sequence corresponds to the ordered list of item IDs
     a user interacted with (based on timestamp).
+    If max_hist is given (int > 0), keep only the last max_hist items.
     """
+    from collections import defaultdict
     user_history = defaultdict(list)
 
     # Step 1: group items per user
@@ -83,6 +85,11 @@ def create_plain_sequences_dataset(ds, asin2id):
     for user_id, items in user_history.items():
         sorted_items = sorted(items, key=lambda x: x[0])  # sort by timestamp
         item_ids = [asin2id[a] for _, a in sorted_items if a in asin2id]
+
+        # ✨ NEW: cap history length
+        if isinstance(max_hist, int) and max_hist > 0:
+            item_ids = item_ids[-max_hist:]
+
         if len(item_ids) > 0:
             sequences.append({"sequences": item_ids})
 
@@ -204,17 +211,175 @@ def create_labels(ds: Dataset) -> Dataset:
     return new_ds
 
 
-def prepare_data(name, K=5, split_type: Literal["user", "leave_one_out"] = "user",
-    ratios: Tuple[float, float, float] = (0.8, 0.1, 0.1)):
+
+from datasets import Dataset
+from typing import Dict, List, Tuple, Literal, Iterable, Optional
+from collections import defaultdict
+
+# ------------- 1) Build user histories like the second script -------------
+def build_histories_like_other(
+    ds: Dataset,
+    meta_items: set[str],
+    max_hist: int = 50,
+    drop_len_lt2: bool = True,
+) -> Dict[str, List[str]]:
+    """
+    Reproduce the other script's filtering semantics on raw interactions:
+      - keep ONLY interactions whose item is in metadata
+      - sort per user by timestamp (ascending)
+      - drop users whose history is empty (or <2 if drop_len_lt2=True)
+      - truncate to the LAST `max_hist` items
+    Returns: user -> list of ASINs (strings), already truncated.
+    """
+    per_user: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+    for ex in ds:
+        asin = ex["parent_asin"]
+        if asin not in meta_items:
+            continue
+        per_user[ex["user_id"]].append((ex["timestamp"], asin))
+
+    histories_asin: Dict[str, List[str]] = {}
+    for u, pairs in per_user.items():
+        if not pairs:
+            continue
+        pairs_sorted = sorted(pairs, key=lambda t: t[0])
+        asins = [a for _, a in pairs_sorted]
+
+        # truncate to last max_hist
+        if isinstance(max_hist, int) and max_hist > 0:
+            asins = asins[-max_hist:]
+
+        # drop if history is effectively empty for a (history, target) row
+        # (the second script removes rows with empty history; here we
+        # enforce seq length >= 2 so that at least one past item exists)
+        if drop_len_lt2 and len(asins) < 2:
+            continue
+
+        histories_asin[u] = asins
+
+    return histories_asin
+
+
+# ------------- 2) Build mapping ONLY from the kept items -------------
+def build_mapping_from_histories(
+    histories_asin: Dict[str, List[str]]
+) -> Tuple[Dict[str, int], Dict[int, str]]:
+    """
+    Build asin2id / id2asin from the union of items that REMAIN
+    after metadata filtering + dropping + truncation.
+    """
+    kept_asins = set()
+    for asins in histories_asin.values():
+        kept_asins.update(asins)
+    kept_asins = list(kept_asins)
+
+    asin2id = {a: i for i, a in enumerate(kept_asins)}
+    id2asin = {i: a for a, i in asin2id.items()}
+    return asin2id, id2asin
+
+
+# ------------- 3) Convert histories to HF Dataset with 'sequences' -------------
+def histories_to_sequences_dataset(
+    histories_asin: Dict[str, List[str]],
+    asin2id: Dict[str, int],
+    include_user_id: bool = True,
+) -> Dataset:
+    """
+    Convert per-user asin histories to a HF Dataset with 'sequences' (list[int]),
+    matching your downstream pipeline.
+    """
+    rows = []
+    for u, asins in histories_asin.items():
+        seq_ids = [asin2id[a] for a in asins if a in asin2id]
+        if not seq_ids:
+            continue
+        row = {"sequences": seq_ids}
+        if include_user_id:
+            row["user_id"] = u
+        rows.append(row)
+    return Dataset.from_list(rows)
+
+
+# ------------- 4) One-shot "like the second script" prepare function -------------
+def prepare_data_like_other_filtering(
+    name: str,
+    split_type: Literal["user", "leave_one_out"] = "user",
+    ratios: Tuple[float, float, float] = (0.8, 0.1, 0.1),
+    max_hist: int = 50,
+    filter_by_meta: bool = True,
+):
+    """
+    Prepare data using the SAME filtering semantics as the second script:
+      - metadata-only items
+      - drop empty histories (require len >= 2)
+      - truncate to last `max_hist`
+      - build item vocab ONLY from what's left
+    Then reuse your split + label creators.
+    """
+    # 1) Load raw interactions (user_id, parent_asin, timestamp)
+    ds = load_Amazon_dataset_hf(name, only_rating=True)
+
+    # 2) Metadata set (same criterion as the other code)
+    meta_asins = load_meta_item_set(name) if filter_by_meta else set(ds["parent_asin"])
+
+    # 3) Build histories like the other script
+    histories_asin = build_histories_like_other(
+        ds, meta_items=meta_asins, max_hist=max_hist, drop_len_lt2=True
+    )
+
+    # 4) Build mapping ONLY from remaining items
+    asin2id, id2asin = build_mapping_from_histories(histories_asin)
+
+    # 5) Convert to sequences dataset (list[int]) and proceed as usual
+    ds_seq = histories_to_sequences_dataset(histories_asin, asin2id, include_user_id=True)
+
+    # 6) Your existing split + label pipeline
+    ds_train, ds_valid, ds_test = split_train_test(ds_seq, split_type, ratios)
+    ds_train = create_labels(ds_train)
+    ds_valid = create_labels(ds_valid)
+    ds_test  = create_labels(ds_test)
+
+    return ds_train, ds_valid, ds_test, asin2id
+
+
+
+def prepare_data(
+    name,
+    K=5,
+    split_type: Literal["user", "leave_one_out"] = "user",
+    ratios: Tuple[float, float, float] = (0.8, 0.1, 0.1),
+    max_hist: int | None = None,
+    filter_by_meta: bool = True,  # NEW
+):
     ds = load_Amazon_dataset_hf(name)
+
+    if filter_by_meta:
+        meta_asins = load_meta_item_set(name)
+        ds = ds.filter(lambda ex: ex["parent_asin"] in meta_asins)
+
     if K:
         ds = filter_K_core(ds, K)
+
     asin2id, id2asin = create_item_id_mappings(ds)
-    ds = create_plain_sequences_dataset(ds, asin2id)
+    ds = create_plain_sequences_dataset(ds, asin2id, max_hist=max_hist)
     ds_train, ds_valid, ds_test = split_train_test(ds, split_type, ratios)
     ds_train = create_labels(ds_train)
     ds_valid = create_labels(ds_valid)
-    ds_test = create_labels(ds_test)
+    ds_test  = create_labels(ds_test)
     return ds_train, ds_valid, ds_test, asin2id
 
     
+
+
+def load_meta_item_set(name: str) -> set[str]:
+    """
+    Return the set of parent_asin that have metadata in Amazon-2023.
+    """
+    meta = load_dataset(
+        "McAuley-Lab/Amazon-Reviews-2023",
+        f"raw_meta_{name}",
+        trust_remote_code=True
+    )["full"]
+    return set(meta["parent_asin"])
+
+
